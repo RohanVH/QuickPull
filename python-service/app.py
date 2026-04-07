@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
@@ -46,6 +47,8 @@ EXTRACTION_TIMEOUT_SECONDS = int(os.getenv("EXTRACTION_TIMEOUT_SECONDS", "9"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "180"))
 GALLERY_TIMEOUT_SECONDS = int(os.getenv("GALLERY_TIMEOUT_SECONDS", "15"))
 PINTEREST_TIMEOUT_SECONDS = int(os.getenv("PINTEREST_TIMEOUT_SECONDS", "6"))
+TEMP_FILE_TTL_SECONDS = int(os.getenv("TEMP_FILE_TTL_SECONDS", "3600"))
+MAX_DOWNLOAD_SIZE_BYTES = int(os.getenv("MAX_DOWNLOAD_SIZE_BYTES", str(500 * 1024 * 1024)))
 
 
 class PreviewRequest(BaseModel):
@@ -86,6 +89,7 @@ class YtdlpLogger:
 @app.on_event("startup")
 def startup_log() -> None:
     LOGGER.info("Python service running on port 8000")
+    cleanup_old_files()
 
 
 @app.get("/health")
@@ -94,11 +98,16 @@ def health() -> dict[str, str]:
 
 
 @app.get("/files/{filename}")
-def get_file(filename: str) -> FileResponse:
+def get_file(filename: str, background_tasks: BackgroundTasks) -> FileResponse:
     safe_name = Path(filename).name
+    if safe_name != filename or not re.fullmatch(r"[\w.\- ]+", safe_name):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     file_path = OUTPUT_DIR / safe_name
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
+
+    background_tasks.add_task(delete_file, file_path)
 
     return FileResponse(
         file_path,
@@ -126,6 +135,42 @@ def sanitize_filename(value: str, fallback: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]+', " ", value)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     return cleaned[:120] or fallback
+
+
+def delete_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        LOGGER.warning("Temporary file cleanup failed for %s", path)
+
+
+def cleanup_old_files() -> None:
+    cutoff = time.time() - TEMP_FILE_TTL_SECONDS
+    for file_path in OUTPUT_DIR.iterdir():
+        if not file_path.is_file():
+            continue
+        try:
+            if file_path.stat().st_mtime < cutoff:
+                file_path.unlink(missing_ok=True)
+        except Exception:
+            LOGGER.warning("Old file cleanup failed for %s", file_path)
+
+
+def ensure_safe_file(path: Path) -> Path:
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Prepared file missing") from error
+
+    if size <= 0:
+        delete_file(path)
+        raise HTTPException(status_code=500, detail="Prepared file was empty")
+
+    if size > MAX_DOWNLOAD_SIZE_BYTES:
+        delete_file(path)
+        raise HTTPException(status_code=413, detail="Prepared file exceeded the maximum allowed size")
+
+    return path
 
 
 def run_with_timeout(fn: Callable[..., Any], *args: Any, timeout_seconds: int, timeout_message: str) -> Any:
@@ -886,6 +931,7 @@ def _download_with_options(url: str, options: dict[str, Any]) -> None:
 def download(payload: DownloadRequest) -> dict[str, Any]:
     platform = detect_platform(str(payload.url))
     LOGGER.info("Download request received", extra={"url": str(payload.url), "format_id": payload.format_id, "platform": platform})
+    cleanup_old_files()
     if platform == "spotify":
         return {
             "success": False,
@@ -917,21 +963,23 @@ def download(payload: DownloadRequest) -> dict[str, Any]:
         if direct_url.endswith(".m3u8") and shutil.which("ffmpeg"):
             output_file = OUTPUT_DIR / f"{title_slug}-{media_id}.mp4"
             if download_hls_stream(direct_url, output_file):
+                prepared_file = ensure_safe_file(output_file)
                 return {
                     "success": True,
-                    "download_url": f"{BASE_DOWNLOAD_URL}/{output_file.name}",
+                    "download_url": f"{BASE_DOWNLOAD_URL}/{prepared_file.name}",
                     "status": "completed",
-                    "filename": output_file.name,
+                    "filename": prepared_file.name,
                 }
         ext = infer_extension(direct_url) or "bin"
         output_file = OUTPUT_DIR / f"{title_slug}-{media_id}.{ext}"
         downloaded_file = download_remote_asset(direct_url, output_file)
         if downloaded_file:
+            prepared_file = ensure_safe_file(downloaded_file)
             return {
                 "success": True,
-                "download_url": f"{BASE_DOWNLOAD_URL}/{downloaded_file.name}",
+                "download_url": f"{BASE_DOWNLOAD_URL}/{prepared_file.name}",
                 "status": "completed",
-                "filename": downloaded_file.name,
+                "filename": prepared_file.name,
             }
         return {
             "success": False,
@@ -975,13 +1023,14 @@ def download(payload: DownloadRequest) -> dict[str, Any]:
 
     selected_ext = resolve_extension(info, payload.format_id)
     final_name = f"{title_slug}-{media_id}.{selected_ext}"
-    download_url = f"{BASE_DOWNLOAD_URL}/{final_name}"
+    prepared_file = ensure_safe_file(OUTPUT_DIR / final_name)
+    download_url = f"{BASE_DOWNLOAD_URL}/{prepared_file.name}"
     LOGGER.info("Download completed", extra={"url": str(payload.url), "download_url": download_url})
     return {
         "success": True,
         "download_url": download_url,
         "status": "completed",
-        "filename": final_name,
+        "filename": prepared_file.name,
     }
 
 
@@ -1074,6 +1123,7 @@ def seconds_to_hms(seconds: int | None) -> str | None:
     if hours:
         return f"{hours}:{minutes:02d}:{sec:02d}"
     return f"{minutes}:{sec:02d}"
+
 
 
 
