@@ -1,0 +1,7 @@
+.git
+.next
+node_modules
+npm-debug.log
+python-service/.venv
+python-service/downloads
+*.log

@@ -1,0 +1,13 @@
+.next
+node_modules
+.env
+.env.local
+dist
+coverage
+*.log
+*.tsbuildinfo
+downloads
+python-service/downloads
+python-service/.venv
+python-service/__pycache__
+tmp

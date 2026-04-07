@@ -1,0 +1,27 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      PYTHON_SERVICE_URL: http://backend:8000
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ./python-service
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      OUTPUT_DIR: /app/downloads
+      BASE_DOWNLOAD_URL: http://localhost:8000/files
+    volumes:
+      - quickpull-downloads:/app/downloads
+
+volumes:
+  quickpull-downloads:
